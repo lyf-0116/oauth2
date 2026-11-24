@@ -25,6 +25,32 @@ type Transport struct {
 	// Base is the base RoundTripper used to make HTTP requests.
 	// If nil, http.DefaultTransport is used.
 	Base http.RoundTripper
+
+	// BeforeRequest, if non-nil, is invoked on the request that is
+	// actually sent, after the incoming request has been cloned and after
+	// the Authorization header has been added.
+	//
+	// The hook owns the request it receives: it must not mutate it in
+	// place and instead return the request (cloned or modified) that the
+	// Transport should hand to the base RoundTripper. Returning nil, or
+	// returning a request other than the one passed in, is supported. A
+	// non-nil error aborts the RoundTrip without contacting the server.
+	//
+	// Because the hook runs against the cloned request, its changes are
+	// immune to the clones performed by the Transport itself and by the
+	// surrounding http.Client (redirects, retries and authentication
+	// injection each work on their own copy). The returned request is the
+	// single owner of the hook's modifications for this RoundTrip.
+	//
+	// The hook runs once per RoundTrip. An http.Client following a
+	// redirect enters RoundTrip again for each hop, so the hook is
+	// re-invoked on every redirected request and its modifications follow
+	// the redirect automatically.
+	//
+	// If the hook returns a request whose Body differs from the incoming
+	// request's Body, the original Body is closed by the Transport; the
+	// returned Body is then owned by the base RoundTripper.
+	BeforeRequest func(*http.Request) (*http.Request, error)
 }
 
 // RoundTrip authorizes and authenticates the request with an
@@ -47,8 +73,27 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
+	// Clone first, and run every modification against the clone. The
+	// caller's request is never mutated, and there is exactly one request
+	// instance from this point on, so a hook cannot end up editing a
+	// detached copy that the base RoundTripper never sees.
 	req2 := req.Clone(req.Context())
 	token.SetAuthHeader(req2)
+	if t.BeforeRequest != nil {
+		var hookedReq *http.Request
+		hookedReq, err = t.BeforeRequest(req2)
+		if err != nil {
+			return nil, err
+		}
+		if hookedReq == nil {
+			return nil, errors.New("oauth2: Transport's BeforeRequest returned a nil request")
+		}
+		if req2.Body != nil && hookedReq.Body != req2.Body {
+			req2.Body.Close()
+			reqBodyClosed = true
+		}
+		req2 = hookedReq
+	}
 
 	// req.Body is assumed to be closed by the base RoundTripper.
 	reqBodyClosed = true
