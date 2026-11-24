@@ -59,6 +59,24 @@ type Token struct {
 	// Raw optionally contains extra metadata from the server
 	// when updating a token.
 	Raw any
+
+	// RetrievedAt is the local wall-clock time, read immediately after the
+	// token response was received. It carries a monotonic clock reading and
+	// anchors the relative portion of Expiry, so expiry checks do not depend
+	// solely on a wall clock that may be adjusted backwards or forwards.
+	RetrievedAt time.Time
+
+	// ServerTimeOffset is the difference between the server's clock and the
+	// local clock observed when the token was retrieved:
+	// serverTime - localTime. It is derived from the HTTP "Date" response
+	// header and used to correct expiry checks when no monotonic anchor is
+	// available (for example, after a token has been serialized).
+	ServerTimeOffset time.Duration
+
+	// WeakExpiry reports that the expiry decision cannot be anchored to a
+	// monotonic clock or a server-provided time, so it relies on the local
+	// wall clock alone. Such a decision is vulnerable to clock adjustments.
+	WeakExpiry bool
 }
 
 // tokenJSON is the struct representing the HTTP response from OAuth2
@@ -76,11 +94,29 @@ type tokenJSON struct {
 	ErrorURI         string `json:"error_uri"`
 }
 
-func (e *tokenJSON) expiry() (t time.Time) {
+// expiry returns the token's expiration time computed relative to now, the
+// local time at which the token response was received.
+func (e *tokenJSON) expiry(now time.Time) (t time.Time) {
 	if v := e.ExpiresIn; v != 0 {
-		return time.Now().Add(time.Duration(v) * time.Second)
+		return now.Add(time.Duration(v) * time.Second)
 	}
 	return
+}
+
+// serverTimeOffset returns serverTime - localTime derived from the HTTP
+// "Date" response header. It reports ok=false when the header is absent or
+// cannot be parsed, in which case no server clock is available and expiry
+// checks must fall back to the uncorrected local wall clock.
+func serverTimeOffset(h http.Header, localTime time.Time) (offset time.Duration, ok bool) {
+	date := h.Get("Date")
+	if date == "" {
+		return 0, false
+	}
+	serverTime, err := http.ParseTime(date)
+	if err != nil {
+		return 0, false
+	}
+	return serverTime.Sub(localTime.Round(0)), true
 }
 
 type expirationTime int32
@@ -260,11 +296,16 @@ func doTokenRoundTrip(ctx context.Context, req *http.Request) (*Token, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Capture the local time as soon as the response arrives. It anchors the
+	// relative expiry (expires_in) to a monotonic clock reading and is the
+	// local side of the server time offset below.
+	now := time.Now()
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	r.Body.Close()
 	if err != nil {
 		return nil, fmt.Errorf("oauth2: cannot fetch token: %v", err)
 	}
+	offset, hasServerTime := serverTimeOffset(r.Header, now)
 
 	failureStatus := r.StatusCode < 200 || r.StatusCode > 299
 	retrieveError := &RetrieveError{
@@ -297,7 +338,7 @@ func doTokenRoundTrip(ctx context.Context, req *http.Request) (*Token, error) {
 		e := vals.Get("expires_in")
 		expires, _ := strconv.Atoi(e)
 		if expires != 0 {
-			token.Expiry = time.Now().Add(time.Duration(expires) * time.Second)
+			token.Expiry = now.Add(time.Duration(expires) * time.Second)
 		}
 	default:
 		var tj tokenJSON
@@ -314,11 +355,17 @@ func doTokenRoundTrip(ctx context.Context, req *http.Request) (*Token, error) {
 			AccessToken:  tj.AccessToken,
 			TokenType:    tj.TokenType,
 			RefreshToken: tj.RefreshToken,
-			Expiry:       tj.expiry(),
+			Expiry:       tj.expiry(now),
 			ExpiresIn:    int64(tj.ExpiresIn),
 			Raw:          make(map[string]any),
 		}
 		json.Unmarshal(body, &token.Raw) // no error checks for optional fields
+	}
+	token.RetrievedAt = now
+	if hasServerTime {
+		token.ServerTimeOffset = offset
+	} else {
+		token.WeakExpiry = true
 	}
 	// according to spec, servers should respond status 400 in error case
 	// https://www.rfc-editor.org/rfc/rfc6749#section-5.2

@@ -64,6 +64,24 @@ type Token struct {
 	// expired, by subtracting from Expiry. If zero, defaultExpiryDelta
 	// is used.
 	expiryDelta time.Duration
+
+	// retrievedAt is the local time (including a monotonic clock reading)
+	// at which the token response was received. Tokens built from an
+	// "expires_in" field measure elapsed time against this anchor rather
+	// than comparing two wall-clock instants, so a wall clock adjusted
+	// backwards or forwards cannot resurrect or prematurely expire them.
+	retrievedAt time.Time
+
+	// serverTimeOffset is serverTime - localTime observed at retrieval,
+	// derived from the HTTP "Date" header. It corrects expiry checks for
+	// tokens whose monotonic anchor has been lost (typically after
+	// serialization), when the local clock disagrees with the server.
+	serverTimeOffset time.Duration
+
+	// hasServerTime reports whether serverTimeOffset is meaningful, i.e. the
+	// server provided a usable "Date" header. When false and no monotonic
+	// anchor is available, expiry is judged on the local wall clock alone.
+	hasServerTime bool
 }
 
 // Type returns t.TokenType if non-empty, else "Bearer".
@@ -133,6 +151,28 @@ func (t *Token) Extra(key string) any {
 // timeNow is time.Now but pulled out as a variable for tests.
 var timeNow = time.Now
 
+// hasMonotonicReading reports whether t carries a monotonic clock reading.
+// Times returned by time.Now do; times reconstructed from a wall-clock value
+// (time.Unix, parsed strings, JSON) do not. Round(0) is documented to strip
+// the monotonic reading while preserving the wall-clock component. Time
+// equality (==) compares every field, unlike Time.Equal which ignores the
+// monotonic reading, so t differs from t.Round(0) exactly when it has one.
+func hasMonotonicReading(t time.Time) bool {
+	return t != t.Round(0)
+}
+
+// monotonicSince reports the monotonic-clock elapsed duration since ref.
+// It returns the elapsed duration and ok=false if ref or now carries no
+// monotonic clock reading (for example, because ref was reconstructed from
+// JSON or built manually), in which case a monotonic comparison is
+// impossible.
+func monotonicSince(ref, now time.Time) (time.Duration, bool) {
+	if hasMonotonicReading(ref) && hasMonotonicReading(now) {
+		return now.Sub(ref), true
+	}
+	return 0, false
+}
+
 // expired reports whether the token is expired.
 // t must be non-nil.
 func (t *Token) expired() bool {
@@ -144,12 +184,67 @@ func (t *Token) expired() bool {
 	if t.expiryDelta != 0 {
 		expiryDelta = t.expiryDelta
 	}
-	return t.Expiry.Round(0).Add(-expiryDelta).Before(timeNow())
+
+	now := timeNow()
+
+	// Strong path: the token was retrieved within this process and therefore
+	// has a monotonic anchor. Measure elapsed time against the monotonic
+	// clock, which never jumps, so wall-clock adjustments cannot change the
+	// verdict. Expiry and retrievedAt were produced from the same clock
+	// reading, so their difference is the token's intended lifetime.
+	if elapsed, ok := monotonicSince(t.retrievedAt, now); ok {
+		lifetime := t.Expiry.Sub(t.retrievedAt)
+		return lifetime-elapsed <= expiryDelta
+	}
+
+	// Weak path: no monotonic anchor is available. If the server supplied a
+	// time at retrieval, estimate the current server time and compare in the
+	// server's frame; otherwise compare against the uncorrected local wall
+	// clock, which is a weak verdict observable through Token.WeakExpiry.
+	if t.hasServerTime {
+		now = now.Add(t.serverTimeOffset)
+	}
+	return t.Expiry.Round(0).Add(-expiryDelta).Before(now.Round(0))
 }
 
 // Valid reports whether t is non-nil, has an AccessToken, and is not expired.
 func (t *Token) Valid() bool {
 	return t != nil && t.AccessToken != "" && !t.expired()
+}
+
+// WeakExpiry reports whether the token's expiration is judged solely against
+// the local wall clock, without a monotonic-clock anchor or a time supplied
+// by the authorization server.
+//
+// A weak verdict is vulnerable to the local clock being adjusted: setting it
+// backwards can make an expired token look valid again, while setting it
+// forwards can make a freshly issued token look expired. It occurs when the
+// token was reconstructed without retrieval metadata (for example, after
+// JSON serialization), or when the token endpoint provided no usable "Date"
+// response header at retrieval time.
+func (t *Token) WeakExpiry() bool {
+	if t == nil {
+		return false
+	}
+	_, hasMonotonic := monotonicSince(t.retrievedAt, timeNow())
+	return !hasMonotonic && !t.hasServerTime
+}
+
+// SetRetrievalMetadata records the clock context in which the token was
+// obtained. retrievedAt is the local time (with a monotonic reading) at which
+// the response was received; serverTimeOffset is serverTime - localTime; and
+// hasServerTime reports whether that offset was supplied by the server.
+//
+// This is intended for related packages implementing derivative OAuth2 flows
+// that reconstruct a Token from an internal representation. Most callers
+// should never need it.
+func (t *Token) SetRetrievalMetadata(retrievedAt time.Time, serverTimeOffset time.Duration, hasServerTime bool) {
+	if t == nil {
+		return
+	}
+	t.retrievedAt = retrievedAt
+	t.serverTimeOffset = serverTimeOffset
+	t.hasServerTime = hasServerTime
 }
 
 // tokenFromInternal maps an *internal.Token struct into
@@ -159,12 +254,15 @@ func tokenFromInternal(t *internal.Token) *Token {
 		return nil
 	}
 	return &Token{
-		AccessToken:  t.AccessToken,
-		TokenType:    t.TokenType,
-		RefreshToken: t.RefreshToken,
-		Expiry:       t.Expiry,
-		ExpiresIn:    t.ExpiresIn,
-		raw:          t.Raw,
+		AccessToken:      t.AccessToken,
+		TokenType:        t.TokenType,
+		RefreshToken:     t.RefreshToken,
+		Expiry:           t.Expiry,
+		ExpiresIn:        t.ExpiresIn,
+		raw:              t.Raw,
+		retrievedAt:      t.RetrievedAt,
+		serverTimeOffset: t.ServerTimeOffset,
+		hasServerTime:    !t.WeakExpiry,
 	}
 }
 

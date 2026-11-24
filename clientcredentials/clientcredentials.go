@@ -120,5 +120,7 @@ func (c *tokenSource) Token() (*oauth2.Token, error) {
 		RefreshToken: tk.RefreshToken,
 		Expiry:       tk.Expiry,
 	}
-	return t.WithExtra(tk.Raw), nil
+	t = t.WithExtra(tk.Raw)
+	t.SetRetrievalMetadata(tk.RetrievedAt, tk.ServerTimeOffset, !tk.WeakExpiry)
+	return t, nil
 }
