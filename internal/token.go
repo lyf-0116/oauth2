@@ -214,6 +214,7 @@ func cloneURLValues(v url.Values) url.Values {
 
 func RetrieveToken(ctx context.Context, clientID, clientSecret, tokenURL string, v url.Values, authStyle AuthStyle, styleCache *AuthStyleCache) (*Token, error) {
 	needsAuthStyleProbe := authStyle == AuthStyleUnknown
+	allowMissingAccessToken := v.Get("grant_type") == "refresh_token"
 	if needsAuthStyleProbe {
 		if style, ok := styleCache.lookupAuthStyle(tokenURL, clientID); ok {
 			authStyle = style
@@ -226,7 +227,7 @@ func RetrieveToken(ctx context.Context, clientID, clientSecret, tokenURL string,
 	if err != nil {
 		return nil, err
 	}
-	token, err := doTokenRoundTrip(ctx, req)
+	token, err := doTokenRoundTrip(ctx, req, allowMissingAccessToken)
 	if err != nil && needsAuthStyleProbe {
 		// If we get an error, assume the server wants the
 		// clientID & clientSecret in a different form.
@@ -242,20 +243,15 @@ func RetrieveToken(ctx context.Context, clientID, clientSecret, tokenURL string,
 		// So just try both ways.
 		authStyle = AuthStyleInParams // the second way we'll try
 		req, _ = newTokenRequest(tokenURL, clientID, clientSecret, v, authStyle)
-		token, err = doTokenRoundTrip(ctx, req)
+		token, err = doTokenRoundTrip(ctx, req, allowMissingAccessToken)
 	}
 	if needsAuthStyleProbe && err == nil {
 		styleCache.setAuthStyle(tokenURL, clientID, authStyle)
 	}
-	// Don't overwrite `RefreshToken` with an empty value
-	// if this was a token refreshing request.
-	if token != nil && token.RefreshToken == "" {
-		token.RefreshToken = v.Get("refresh_token")
-	}
 	return token, err
 }
 
-func doTokenRoundTrip(ctx context.Context, req *http.Request) (*Token, error) {
+func doTokenRoundTrip(ctx context.Context, req *http.Request, allowMissingAccessToken bool) (*Token, error) {
 	r, err := ContextClient(ctx).Do(req.WithContext(ctx))
 	if err != nil {
 		return nil, err
@@ -297,6 +293,7 @@ func doTokenRoundTrip(ctx context.Context, req *http.Request) (*Token, error) {
 		e := vals.Get("expires_in")
 		expires, _ := strconv.Atoi(e)
 		if expires != 0 {
+			token.ExpiresIn = int64(expires)
 			token.Expiry = time.Now().Add(time.Duration(expires) * time.Second)
 		}
 	default:
@@ -326,7 +323,7 @@ func doTokenRoundTrip(ctx context.Context, req *http.Request) (*Token, error) {
 	if failureStatus || retrieveError.ErrorCode != "" {
 		return nil, retrieveError
 	}
-	if token.AccessToken == "" {
+	if !allowMissingAccessToken && token.AccessToken == "" {
 		return nil, errors.New("oauth2: server response missing access_token")
 	}
 	return token, nil

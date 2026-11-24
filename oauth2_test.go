@@ -571,6 +571,168 @@ func TestRefreshToken_RefreshTokenPreservation(t *testing.T) {
 	}
 }
 
+func TestRefreshToken_MissingRefreshTokenReusesCurrent(t *testing.T) {
+	var refreshRequests []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("ParseForm: %v", err)
+		}
+		refreshRequests = append(refreshRequests, r.Form.Get("refresh_token"))
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"access_token":"NEW_ACCESS_TOKEN","token_type":"bearer","expires_in":3600}`)
+	}))
+	defer ts.Close()
+
+	conf := newConf(ts.URL)
+	source := conf.TokenSource(context.Background(), &Token{
+		AccessToken:  "OLD_ACCESS_TOKEN",
+		TokenType:    "bearer",
+		RefreshToken: "OLD_REFRESH_TOKEN",
+		Expiry:       timeNow().Add(-time.Hour),
+	})
+	refresher := source.(*reuseTokenSource).new.(*tokenRefresher)
+
+	for i := 0; i < 2; i++ {
+		token, err := refresher.Token()
+		if err != nil {
+			t.Fatalf("refresh %d: got err = %v; want none", i+1, err)
+		}
+		if got, want := token.RefreshToken, "OLD_REFRESH_TOKEN"; got != want {
+			t.Fatalf("refresh %d: RefreshToken = %q; want %q", i+1, got, want)
+		}
+	}
+
+	wantRequests := []string{"OLD_REFRESH_TOKEN", "OLD_REFRESH_TOKEN"}
+	if len(refreshRequests) != len(wantRequests) {
+		t.Fatalf("refresh requests = %v; want %v", refreshRequests, wantRequests)
+	}
+	for i := range wantRequests {
+		if refreshRequests[i] != wantRequests[i] {
+			t.Fatalf("refresh request %d token = %q; want %q", i+1, refreshRequests[i], wantRequests[i])
+		}
+	}
+}
+
+func TestRefreshToken_OnlyRefreshTokenPreservesAccessToken(t *testing.T) {
+	var refreshRequests []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Errorf("ParseForm: %v", err)
+		}
+		refreshRequests = append(refreshRequests, r.Form.Get("refresh_token"))
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"refresh_token":"ROTATED_REFRESH_TOKEN"}`)
+	}))
+	defer ts.Close()
+
+	oldExpiry := time.Unix(123456789, 0)
+	conf := newConf(ts.URL)
+	source := conf.TokenSource(context.Background(), &Token{
+		AccessToken:  "OLD_ACCESS_TOKEN",
+		TokenType:    "mac",
+		RefreshToken: "OLD_REFRESH_TOKEN",
+		ExpiresIn:    60,
+		Expiry:       oldExpiry,
+	})
+
+	first, err := source.Token()
+	if err != nil {
+		t.Fatalf("first Token: got err = %v; want none", err)
+	}
+	if first.AccessToken != "OLD_ACCESS_TOKEN" {
+		t.Errorf("AccessToken = %q; want old access token", first.AccessToken)
+	}
+	if first.Type() != "MAC" {
+		t.Errorf("Type() = %q; want %q", first.Type(), "MAC")
+	}
+	if first.RefreshToken != "ROTATED_REFRESH_TOKEN" {
+		t.Errorf("RefreshToken = %q; want rotated token", first.RefreshToken)
+	}
+	if first.ExpiresIn != 60 || !first.Expiry.Equal(oldExpiry) {
+		t.Errorf("expiry = (%d, %v); want (60, %v)", first.ExpiresIn, first.Expiry, oldExpiry)
+	}
+
+	req, err := http.NewRequest(http.MethodGet, ts.URL+"/resource", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.SetAuthHeader(req)
+	if got, want := req.Header.Get("Authorization"), "MAC OLD_ACCESS_TOKEN"; got != want {
+		t.Errorf("Authorization = %q; want %q", got, want)
+	}
+
+	second, err := source.Token()
+	if err != nil {
+		t.Fatalf("second Token: got err = %v; want none", err)
+	}
+	if second.AccessToken != "OLD_ACCESS_TOKEN" {
+		t.Errorf("second AccessToken = %q; want old access token", second.AccessToken)
+	}
+	if got, want := refreshRequests, []string{"OLD_REFRESH_TOKEN", "ROTATED_REFRESH_TOKEN"}; len(got) != 2 || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("refresh requests = %v; want %v", got, want)
+	}
+}
+
+func TestRefreshToken_ExplicitEmptyRefreshTokenClears(t *testing.T) {
+	requests := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"access_token":"NEW_ACCESS_TOKEN","token_type":"bearer","expires_in":3600,"refresh_token":""}`)
+	}))
+	defer ts.Close()
+
+	conf := newConf(ts.URL)
+	source := conf.TokenSource(context.Background(), &Token{RefreshToken: "OLD_REFRESH_TOKEN"})
+	refresher := source.(*reuseTokenSource).new.(*tokenRefresher)
+
+	token, err := refresher.Token()
+	if err != nil {
+		t.Fatalf("first Token: got err = %v; want none", err)
+	}
+	if token.RefreshToken != "" {
+		t.Fatalf("RefreshToken = %q; want empty", token.RefreshToken)
+	}
+
+	_, err = refresher.Token()
+	if err == nil {
+		t.Fatal("second Token: got nil error; want missing local refresh token error")
+	}
+	if want := "oauth2: token expired and refresh token is not set"; err.Error() != want {
+		t.Fatalf("error = %q; want %q", err.Error(), want)
+	}
+	if requests != 1 {
+		t.Fatalf("refresh requests = %d; want 1", requests)
+	}
+}
+
+func TestRefreshToken_ExplicitEmptyAccessTokenClears(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"access_token":"","refresh_token":"ROTATED_REFRESH_TOKEN"}`)
+	}))
+	defer ts.Close()
+
+	conf := newConf(ts.URL)
+	source := conf.TokenSource(context.Background(), &Token{
+		AccessToken:  "OLD_ACCESS_TOKEN",
+		RefreshToken: "OLD_REFRESH_TOKEN",
+		Expiry:       timeNow().Add(-time.Hour),
+	})
+	refresher := source.(*reuseTokenSource).new.(*tokenRefresher)
+
+	token, err := refresher.Token()
+	if err != nil {
+		t.Fatalf("Token: got err = %v; want none", err)
+	}
+	if token.AccessToken != "" {
+		t.Errorf("AccessToken = %q; want empty", token.AccessToken)
+	}
+	if token.RefreshToken != "ROTATED_REFRESH_TOKEN" {
+		t.Errorf("RefreshToken = %q; want rotated token", token.RefreshToken)
+	}
+}
+
 func TestConfigClientWithToken(t *testing.T) {
 	tok := &Token{
 		AccessToken: "abc123",

@@ -247,8 +247,9 @@ func (c *Config) Client(ctx context.Context, t *Token) *http.Client {
 // Most users will use [Config.Client] instead.
 func (c *Config) TokenSource(ctx context.Context, t *Token) TokenSource {
 	tkr := &tokenRefresher{
-		ctx:  ctx,
-		conf: c,
+		ctx:   ctx,
+		conf:  c,
+		token: t,
 	}
 	if t != nil {
 		tkr.refreshToken = t.RefreshToken
@@ -265,6 +266,7 @@ type tokenRefresher struct {
 	ctx          context.Context // used to get HTTP requests
 	conf         *Config
 	refreshToken string
+	token        *Token
 }
 
 // WARNING: Token is not safe for concurrent access, as it
@@ -272,22 +274,35 @@ type tokenRefresher struct {
 // Within this package, it is used by reuseTokenSource which
 // synchronizes calls to this method with its own mutex.
 func (tf *tokenRefresher) Token() (*Token, error) {
-	if tf.refreshToken == "" {
+	refreshToken := tf.refreshToken
+	if tf.token != nil && tf.token.RefreshToken != "" {
+		refreshToken = tf.token.RefreshToken
+	}
+	if refreshToken == "" {
 		return nil, errors.New("oauth2: token expired and refresh token is not set")
 	}
 
 	tk, err := retrieveToken(tf.ctx, tf.conf, url.Values{
 		"grant_type":    {"refresh_token"},
-		"refresh_token": {tf.refreshToken},
+		"refresh_token": {refreshToken},
 	})
 
 	if err != nil {
 		return nil, err
 	}
-	if tf.refreshToken != tk.RefreshToken {
-		tf.refreshToken = tk.RefreshToken
+
+	current := tf.token
+	if current == nil {
+		current = &Token{RefreshToken: tf.refreshToken}
+	} else if current.RefreshToken == "" && tf.refreshToken != "" {
+		current = current.clone()
+		current.RefreshToken = tf.refreshToken
 	}
-	return tk, nil
+
+	merged := mergeRefreshedToken(current, tk)
+	tf.token = merged
+	tf.refreshToken = merged.RefreshToken
+	return merged, nil
 }
 
 // reuseTokenSource is a TokenSource that holds a single token in memory

@@ -5,6 +5,7 @@
 package oauth2
 
 import (
+	"net/url"
 	"testing"
 	"time"
 )
@@ -76,5 +77,137 @@ func TestTokenTypeMethod(t *testing.T) {
 		if got, want := tc.tok.Type(), tc.want; got != want {
 			t.Errorf("TokenType(%q) = %v; want %v", tc.name, got, want)
 		}
+	}
+}
+
+func TestMergeRefreshedToken(t *testing.T) {
+	oldExpiry := time.Unix(123456789, 0)
+	newExpiry := time.Unix(987654321, 0)
+
+	tests := []struct {
+		name     string
+		response *Token
+		want     *Token
+	}{
+		{
+			name: "missing refresh token is preserved",
+			response: &Token{
+				AccessToken: "new-access",
+				TokenType:   "bearer",
+				ExpiresIn:   3600,
+				Expiry:      newExpiry,
+				raw: map[string]any{
+					"access_token": "new-access",
+					"token_type":   "bearer",
+					"expires_in":   float64(3600),
+				},
+			},
+			want: &Token{
+				AccessToken:  "new-access",
+				TokenType:    "bearer",
+				RefreshToken: "old-refresh",
+				ExpiresIn:    3600,
+				Expiry:       newExpiry,
+			},
+		},
+		{
+			name: "missing access token preserves access state",
+			response: &Token{
+				RefreshToken: "new-refresh",
+				raw:          map[string]any{"refresh_token": "new-refresh"},
+			},
+			want: &Token{
+				AccessToken:  "old-access",
+				TokenType:    "mac",
+				RefreshToken: "new-refresh",
+				ExpiresIn:    60,
+				Expiry:       oldExpiry,
+			},
+		},
+		{
+			name: "explicit empty refresh token clears",
+			response: &Token{
+				raw: map[string]any{"refresh_token": ""},
+			},
+			want: &Token{
+				AccessToken:  "old-access",
+				TokenType:    "mac",
+				RefreshToken: "",
+				ExpiresIn:    60,
+				Expiry:       oldExpiry,
+			},
+		},
+		{
+			name: "explicit null refresh token clears",
+			response: &Token{
+				raw: map[string]any{"refresh_token": nil},
+			},
+			want: &Token{
+				AccessToken: "old-access",
+				TokenType:   "mac",
+				ExpiresIn:   60,
+				Expiry:      oldExpiry,
+			},
+		},
+		{
+			name: "explicit empty form refresh token clears",
+			response: &Token{
+				raw: url.Values{"refresh_token": {""}},
+			},
+			want: &Token{
+				AccessToken: "old-access",
+				TokenType:   "mac",
+				ExpiresIn:   60,
+				Expiry:      oldExpiry,
+			},
+		},
+		{
+			name: "new access token without expiry resets old expiry and type",
+			response: &Token{
+				AccessToken: "new-access",
+				raw:         map[string]any{"access_token": "new-access"},
+			},
+			want: &Token{
+				AccessToken:  "new-access",
+				RefreshToken: "old-refresh",
+			},
+		},
+		{
+			name: "explicit empty expiry clears expiry",
+			response: &Token{
+				AccessToken: "new-access",
+				raw: map[string]any{
+					"access_token": "new-access",
+					"expires_in":   nil,
+				},
+			},
+			want: &Token{
+				AccessToken:  "new-access",
+				RefreshToken: "old-refresh",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			current := &Token{
+				AccessToken:  "old-access",
+				TokenType:    "mac",
+				RefreshToken: "old-refresh",
+				ExpiresIn:    60,
+				Expiry:       oldExpiry,
+			}
+			got := mergeRefreshedToken(current, tt.response)
+			if got.AccessToken != tt.want.AccessToken ||
+				got.TokenType != tt.want.TokenType ||
+				got.RefreshToken != tt.want.RefreshToken ||
+				got.ExpiresIn != tt.want.ExpiresIn ||
+				!got.Expiry.Equal(tt.want.Expiry) {
+				t.Errorf("mergeRefreshedToken() = %#v; want %#v", got, tt.want)
+			}
+			if current.RefreshToken != "old-refresh" {
+				t.Errorf("current token mutated: RefreshToken = %q; want old-refresh", current.RefreshToken)
+			}
+		})
 	}
 }

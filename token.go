@@ -102,6 +102,14 @@ func (t *Token) WithExtra(extra any) *Token {
 	return t2
 }
 
+func (t *Token) clone() *Token {
+	if t == nil {
+		return nil
+	}
+	clone := *t
+	return &clone
+}
+
 // Extra returns an extra field.
 // Extra fields are key-value pairs returned by the server as
 // part of the token retrieval response.
@@ -166,6 +174,94 @@ func tokenFromInternal(t *internal.Token) *Token {
 		ExpiresIn:    t.ExpiresIn,
 		raw:          t.Raw,
 	}
+}
+
+// mergeRefreshedToken merges an incremental token endpoint response into the
+// current token snapshot.
+//
+// A refresh response is not necessarily a complete token. A field absent from
+// the wire response generally keeps its current value, while a field that is
+// present with an empty value replaces the current value with that zero value.
+// The expiration and token type describe the access token, so when a new
+// access token is present they are reset to their zero values if omitted; the
+// zero Expiry then has the package's existing meaning of "no known expiry".
+// When the access token itself is omitted, the response is treated as a
+// refresh-token rotation and all access-token state is preserved.
+//
+// This is the protocol-specific merge table: fields added to token endpoint
+// parsing must explicitly decide their omitted and present-empty behavior
+// here rather than relying on whole-token replacement.
+func mergeRefreshedToken(current, response *Token) *Token {
+	merged := current.clone()
+	if merged == nil {
+		merged = new(Token)
+	}
+	if response == nil {
+		return merged
+	}
+
+	accessTokenPresent := responseWireFieldPresent(response, "access_token", response.AccessToken)
+	if accessTokenPresent {
+		merged.AccessToken = response.AccessToken
+	}
+
+	if responseWireFieldPresent(response, "token_type", response.TokenType) {
+		merged.TokenType = response.TokenType
+	} else if accessTokenPresent {
+		merged.TokenType = ""
+	}
+
+	if responseWireFieldPresent(response, "refresh_token", response.RefreshToken) {
+		merged.RefreshToken = response.RefreshToken
+	}
+
+	if responseExpiryPresent(response) {
+		merged.ExpiresIn = response.ExpiresIn
+		merged.Expiry = response.Expiry
+	} else if accessTokenPresent {
+		merged.ExpiresIn = 0
+		merged.Expiry = time.Time{}
+	}
+
+	// raw documents this particular response. The merged snapshot's typed
+	// fields retain prior values even when those fields are absent here.
+	merged.raw = response.raw
+	return merged
+}
+
+// responseWireFieldPresent reports whether a string field was present in the
+// original JSON or form response. When the raw response representation is not
+// available, a non-zero decoded value is treated as present.
+func responseWireFieldPresent(response *Token, wireName, decodedValue string) bool {
+	if response != nil {
+		switch raw := response.raw.(type) {
+		case map[string]any:
+			_, present := raw[wireName]
+			return present
+		case url.Values:
+			_, present := raw[wireName]
+			return present
+		}
+	}
+	return decodedValue != ""
+}
+
+// responseExpiryPresent is the expiry-specific counterpart of
+// responseWireFieldPresent. Expiry is derived from expires_in, so its wire
+// presence is tracked using expires_in rather than the decoded time.
+func responseExpiryPresent(response *Token) bool {
+	if response == nil {
+		return false
+	}
+	switch raw := response.raw.(type) {
+	case map[string]any:
+		_, present := raw["expires_in"]
+		return present
+	case url.Values:
+		_, present := raw["expires_in"]
+		return present
+	}
+	return response.ExpiresIn != 0 || !response.Expiry.IsZero()
 }
 
 // retrieveToken takes a *Config and uses that to retrieve an *internal.Token.
