@@ -267,10 +267,10 @@ type tokenRefresher struct {
 	refreshToken string
 }
 
-// WARNING: Token is not safe for concurrent access, as it
-// updates the tokenRefresher's refreshToken field.
-// Within this package, it is used by reuseTokenSource which
-// synchronizes calls to this method with its own mutex.
+// WARNING: Token is not safe for concurrent access, as it updates the
+// tokenRefresher's refreshToken field. Within this package, it is used by
+// reuseTokenSource, which coalesces concurrent refreshes so that at most one
+// call to this method runs at a time.
 func (tf *tokenRefresher) Token() (*Token, error) {
 	if tf.refreshToken == "" {
 		return nil, errors.New("oauth2: token expired and refresh token is not set")
@@ -290,6 +290,11 @@ func (tf *tokenRefresher) Token() (*Token, error) {
 	return tk, nil
 }
 
+// refreshFailureCacheWindow is how long a retryable refresh failure is
+// remembered. Callers arriving while it is fresh share the cached error
+// instead of each hitting the token endpoint with another refresh.
+const refreshFailureCacheWindow = 5 * time.Second
+
 // reuseTokenSource is a TokenSource that holds a single token in memory
 // and validates its expiry before each call to retrieve it with
 // Token. If it's expired, it will be auto-refreshed using the
@@ -297,8 +302,19 @@ func (tf *tokenRefresher) Token() (*Token, error) {
 type reuseTokenSource struct {
 	new TokenSource // called when t is expired.
 
-	mu sync.Mutex // guards t
+	mu sync.Mutex // guards t, refresh and the refresh failure state
 	t  *Token
+
+	// refresh, when non-nil, is the channel of the single in-flight
+	// refresh. It is closed when the refresh finishes, unblocking every
+	// caller waiting on it, and then reset to nil.
+	refresh chan struct{}
+
+	// refreshErr and refreshErrAt cache the outcome of the most recent
+	// retryable refresh failure for refreshFailureCacheWindow, so a run of
+	// failures does not turn into a burst of token endpoint requests.
+	refreshErr   error
+	refreshErrAt time.Time
 
 	expiryDelta time.Duration
 }
@@ -307,17 +323,87 @@ type reuseTokenSource struct {
 // refresh the current token and return the new one.
 func (s *reuseTokenSource) Token() (*Token, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.t.Valid() {
-		return s.t, nil
+		token := s.t
+		s.mu.Unlock()
+		return token, nil
 	}
-	t, err := s.new.Token()
-	if err != nil {
+
+	// A retryable refresh failed very recently: share the cached error
+	// rather than starting another network round trip.
+	if s.refreshErr != nil && !invalidCredentialError(s.refreshErr) && timeNow().Sub(s.refreshErrAt) < refreshFailureCacheWindow {
+		err := s.refreshErr
+		s.mu.Unlock()
 		return nil, err
 	}
-	t.expiryDelta = s.expiryDelta
-	s.t = t
-	return t, nil
+
+	// Coalesce onto an in-flight refresh, if there is one. The mutex is
+	// released while waiting, so it only guards state transitions and never
+	// covers the refresh network call itself.
+	if inFlight := s.refresh; inFlight != nil {
+		s.mu.Unlock()
+		<-inFlight
+		s.mu.Lock()
+		if s.t.Valid() {
+			token := s.t
+			s.mu.Unlock()
+			return token, nil
+		}
+		err := s.refreshErr
+		s.mu.Unlock()
+		return nil, err
+	}
+
+	// Become the leader of a new refresh. Closing the channel once the
+	// refresh finishes unblocks every caller waiting on it.
+	inFlight := make(chan struct{})
+	s.refresh = inFlight
+	s.refreshErr = nil
+	s.mu.Unlock()
+
+	token, err := s.new.Token()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	close(inFlight)
+	s.refresh = nil
+	if err != nil {
+		// Record the failure so callers that were waiting on this refresh
+		// observe the same error. The failure is only replayed from the
+		// cache window above for retryable errors; credential failures
+		// always trigger a fresh refresh on the next call.
+		s.refreshErr = err
+		s.refreshErrAt = timeNow()
+		if invalidCredentialError(err) {
+			// The credentials are permanently unusable. Do not let the
+			// cached failure hold back recovery (for example after the
+			// refresh token has been rotated out of band): the cache check
+			// above lets the next caller attempt a fresh refresh at once.
+			return nil, err
+		}
+		return nil, err
+	}
+	token.expiryDelta = s.expiryDelta
+	s.t = token
+	s.refreshErr = nil
+	s.refreshErrAt = time.Time{}
+	return token, nil
+}
+
+// invalidCredentialError reports whether err indicates that the credentials
+// presented to the token endpoint are permanently invalid, rather than a
+// transient failure. Such errors are not cached, so a subsequent refresh can
+// be attempted immediately instead of being held back by the failure cache.
+func invalidCredentialError(err error) bool {
+	var retrieveErr *RetrieveError
+	if !errors.As(err, &retrieveErr) {
+		return false
+	}
+	switch retrieveErr.ErrorCode {
+	case "invalid_grant", "invalid_client":
+		return true
+	}
+	return false
 }
 
 // StaticTokenSource returns a [TokenSource] that always returns the same token.

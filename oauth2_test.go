@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -592,5 +594,236 @@ func TestConfigClientWithToken(t *testing.T) {
 	_, err = c.Do(req)
 	if err != nil {
 		t.Error(err)
+	}
+}
+
+// blockingTokenSource blocks inside Token until release is closed, so a test
+// can hold a refresh in flight and observe other callers coalescing onto it.
+type blockingTokenSource struct {
+	calls   atomic.Int32
+	release chan struct{}
+	token   *Token
+	err     error
+}
+
+func (b *blockingTokenSource) Token() (*Token, error) {
+	b.calls.Add(1)
+	<-b.release
+	return b.token, b.err
+}
+
+// countingTokenSource records how many times Token is invoked.
+type countingTokenSource struct {
+	calls atomic.Int32
+	token *Token
+	err   error
+}
+
+func (c *countingTokenSource) Token() (*Token, error) {
+	c.calls.Add(1)
+	return c.token, c.err
+}
+
+func expiredToken() *Token {
+	return &Token{AccessToken: "old", Expiry: timeNow().Add(-time.Hour)}
+}
+
+func freshToken() *Token {
+	return &Token{AccessToken: "new", Expiry: timeNow().Add(time.Hour)}
+}
+
+// TestReuseTokenSource_CoalescesConcurrentRefreshes verifies that when the
+// cached token is expired, any number of concurrent callers share a single
+// in-flight refresh instead of each performing its own network round trip.
+func TestReuseTokenSource_CoalescesConcurrentRefreshes(t *testing.T) {
+	src := &blockingTokenSource{
+		release: make(chan struct{}),
+		token:   freshToken(),
+	}
+	ts := &reuseTokenSource{t: expiredToken(), new: src}
+
+	const callers = 25
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	errs := make([]error, callers)
+	tokens := make([]*Token, callers)
+	for i := 0; i < callers; i++ {
+		go func(i int) {
+			defer wg.Done()
+			tokens[i], errs[i] = ts.Token()
+		}(i)
+	}
+
+	// Give every caller time to arrive and block on the single refresh.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := src.calls.Load(); got != 1 {
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		break
+	}
+	if got := src.calls.Load(); got != 1 {
+		t.Fatalf("refresh calls while one is in flight = %d; want 1", got)
+	}
+
+	close(src.release)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("caller %d got err = %v; want none", i, err)
+		}
+		if tokens[i].AccessToken != "new" {
+			t.Fatalf("caller %d got token = %q; want %q", i, tokens[i].AccessToken, "new")
+		}
+	}
+	if got := src.calls.Load(); got != 1 {
+		t.Fatalf("total refresh calls = %d; want 1", got)
+	}
+
+	// After a successful refresh, callers must be served from the cache
+	// without any further refresh.
+	token, err := ts.Token()
+	if err != nil {
+		t.Fatalf("got err = %v; want none", err)
+	}
+	if token.AccessToken != "new" {
+		t.Fatalf("got token = %q; want %q", token.AccessToken, "new")
+	}
+	if got := src.calls.Load(); got != 1 {
+		t.Fatalf("refresh calls after success = %d; want 1", got)
+	}
+}
+
+// TestReuseTokenSource_CachesRetryableFailure verifies that a transient
+// refresh failure is cached for a short window: subsequent callers receive
+// the same error without another refresh, and a refresh is retried once the
+// window elapses.
+func TestReuseTokenSource_CachesRetryableFailure(t *testing.T) {
+	base := timeNow()
+	now := base
+	oldTimeNow := timeNow
+	timeNow = func() time.Time { return now }
+	defer func() { timeNow = oldTimeNow }()
+
+	refreshErr := errors.New("oauth2: network unavailable")
+	src := &countingTokenSource{err: refreshErr}
+	ts := &reuseTokenSource{t: expiredToken(), new: src}
+
+	for i := 0; i < 5; i++ {
+		if _, err := ts.Token(); !errors.Is(err, refreshErr) {
+			t.Fatalf("call %d got err = %v; want %v", i, err, refreshErr)
+		}
+	}
+	if got := src.calls.Load(); got != 1 {
+		t.Fatalf("refresh calls inside failure cache window = %d; want 1", got)
+	}
+
+	// Advance past the failure cache window: the next call must refresh.
+	now = base.Add(refreshFailureCacheWindow + time.Second)
+	if _, err := ts.Token(); !errors.Is(err, refreshErr) {
+		t.Fatalf("got err after cache window = %v; want %v", err, refreshErr)
+	}
+	if got := src.calls.Load(); got != 2 {
+		t.Fatalf("refresh calls after cache window = %d; want 2", got)
+	}
+
+	// A later success clears the failure state and installs the new token.
+	now = now.Add(refreshFailureCacheWindow + time.Second)
+	src.err = nil
+	src.token = &Token{AccessToken: "new", Expiry: timeNow().Add(time.Hour)}
+	token, err := ts.Token()
+	if err != nil {
+		t.Fatalf("got err = %v; want none", err)
+	}
+	if token.AccessToken != "new" {
+		t.Fatalf("got token = %q; want %q", token.AccessToken, "new")
+	}
+	if _, err := ts.Token(); err != nil {
+		t.Fatalf("got err after recovery = %v; want none", err)
+	}
+	if got := src.calls.Load(); got != 3 {
+		t.Fatalf("refresh calls after recovery = %d; want 3", got)
+	}
+}
+
+// TestReuseTokenSource_InvalidCredentialBypassesFailureCache verifies that a
+// credential-level failure is not cached: every call attempts a fresh refresh,
+// so recovery after the credentials are fixed is never delayed.
+func TestReuseTokenSource_InvalidCredentialBypassesFailureCache(t *testing.T) {
+	base := timeNow()
+	now := base
+	oldTimeNow := timeNow
+	timeNow = func() time.Time { return now }
+	defer func() { timeNow = oldTimeNow }()
+
+	invalidGrant := &RetrieveError{ErrorCode: "invalid_grant"}
+	src := &countingTokenSource{err: invalidGrant}
+	ts := &reuseTokenSource{t: expiredToken(), new: src}
+
+	for i := 0; i < 5; i++ {
+		if _, err := ts.Token(); !errors.Is(err, invalidGrant) {
+			t.Fatalf("call %d got err = %v; want %v", i, err, invalidGrant)
+		}
+	}
+	if got := src.calls.Load(); got != 5 {
+		t.Fatalf("refresh calls for cached credential failure = %d; want 5", got)
+	}
+
+	// Even well inside the failure cache window, fixed credentials must be
+	// picked up on the very next call.
+	now = base.Add(time.Second)
+	src.err = nil
+	src.token = &Token{AccessToken: "new", Expiry: timeNow().Add(time.Hour)}
+	token, err := ts.Token()
+	if err != nil {
+		t.Fatalf("got err = %v; want none", err)
+	}
+	if token.AccessToken != "new" {
+		t.Fatalf("got token = %q; want %q", token.AccessToken, "new")
+	}
+}
+
+// TestReuseTokenSource_WaitersShareFailure verifies that callers coalesced
+// onto a failing refresh all observe the refresh's error, without launching
+// their own refreshes.
+func TestReuseTokenSource_WaitersShareFailure(t *testing.T) {
+	refreshErr := errors.New("oauth2: network unavailable")
+	src := &blockingTokenSource{
+		release: make(chan struct{}),
+		err:     refreshErr,
+	}
+	ts := &reuseTokenSource{t: expiredToken(), new: src}
+
+	const callers = 10
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	errs := make([]error, callers)
+	for i := 0; i < callers; i++ {
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = ts.Token()
+		}(i)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && src.calls.Load() != 1 {
+		time.Sleep(time.Millisecond)
+	}
+	if got := src.calls.Load(); got != 1 {
+		t.Fatalf("refresh calls while one is in flight = %d; want 1", got)
+	}
+
+	close(src.release)
+	wg.Wait()
+
+	for i, err := range errs {
+		if !errors.Is(err, refreshErr) {
+			t.Fatalf("caller %d got err = %v; want %v", i, err, refreshErr)
+		}
+	}
+	if got := src.calls.Load(); got != 1 {
+		t.Fatalf("total refresh calls = %d; want 1", got)
 	}
 }
