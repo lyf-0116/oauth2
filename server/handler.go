@@ -58,6 +58,13 @@ type (
 
 	// Handler to fetch the access token from the request
 	AccessTokenResolveHandler func(r *http.Request) (string, bool)
+
+	// RedirectURIValidator validates a redirect URI against the client's
+	// registered domain. Managers may implement this interface so the server
+	// can validate redirect targets before redirecting error responses.
+	RedirectURIValidator interface {
+		ValidateRedirectURI(ctx context.Context, clientID, redirectURI string) error
+	}
 )
 
 // ClientFormHandler get client data from form

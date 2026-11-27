@@ -65,6 +65,7 @@ var Descriptions = map[error]string{
 	ErrUnsupportedCodeChallengeMethod: "Selected code_challenge_method not supported",
 	ErrInvalidCodeChallengeLen:        "Code challenge length must be between 43 and 128 charachters long",
 	ErrInsufficientUserAuthentication: "The authentication event does not meet the required assurance level",
+	ErrInvalidRedirectURI:             "The redirect URI is invalid",
 }
 
 // StatusCodes response error HTTP status code
@@ -83,4 +84,5 @@ var StatusCodes = map[error]int{
 	ErrUnsupportedCodeChallengeMethod: 400,
 	ErrInvalidCodeChallengeLen:        400,
 	ErrInsufficientUserAuthentication: 400,
+	ErrInvalidRedirectURI:             400,
 }

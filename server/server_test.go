@@ -251,6 +251,48 @@ func TestImplicit(t *testing.T) {
 		Expect().Status(http.StatusOK)
 }
 
+func TestAuthorizeRedirectURIValidation(t *testing.T) {
+	m := manage.NewDefaultManager()
+	m.MustTokenStorage(store.NewMemoryTokenStore())
+
+	clientStore := store.NewClientStore()
+	_ = clientStore.Set(clientID, &models.Client{
+		ID:     clientID,
+		Secret: clientSecret,
+		Domain: "https://example.com/oauth2/cb",
+	})
+	m.MapClientStorage(clientStore)
+
+	srv = server.NewDefaultServer(m)
+	srv.SetUserAuthorizationHandler(func(w http.ResponseWriter, r *http.Request) (string, error) {
+		return "000000", nil
+	})
+
+	tsrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := srv.HandleAuthorizeRequest(w, r); err != nil {
+			t.Errorf("authorize request failed: %v", err)
+		}
+	}))
+	defer tsrv.Close()
+
+	e := httpexpect.New(t, tsrv.URL)
+	invalid := []string{
+		"https://evilexample.com/oauth2/cb",
+		"https://example.com:8443/oauth2/cb",
+		"https://example.com/other/cb",
+		"https://example.com/oauth2/cb?next=https://evil.example",
+		"https://example.com/oauth2/../admin",
+	}
+	for _, redirectURI := range invalid {
+		e.GET("/authorize").
+			WithQuery("response_type", "code").
+			WithQuery("client_id", clientID).
+			WithQuery("redirect_uri", redirectURI).
+			Expect().Status(http.StatusBadRequest).
+			Header("Location").Empty()
+	}
+}
+
 func TestPasswordCredentials(t *testing.T) {
 	tsrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		testServer(t, w, r)

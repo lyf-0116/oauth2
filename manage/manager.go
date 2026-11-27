@@ -149,6 +149,21 @@ func (m *Manager) GetClient(ctx context.Context, clientID string) (cli oauth2.Cl
 	return
 }
 
+// ValidateRedirectURI validates redirectURI against the domain registered for
+// the client. It is used by the server to validate a redirect target before an
+// error response is redirected to it.
+func (m *Manager) ValidateRedirectURI(ctx context.Context, clientID, redirectURI string) error {
+	if redirectURI == "" {
+		return errors.ErrInvalidRedirectURI
+	}
+
+	cli, err := m.GetClient(ctx, clientID)
+	if err != nil {
+		return err
+	}
+	return m.validateURI(cli.GetDomain(), redirectURI)
+}
+
 // GenerateAuthToken generate the authorization token(code)
 func (m *Manager) GenerateAuthToken(ctx context.Context, rt oauth2.ResponseType, tgr *oauth2.TokenGenerateRequest) (oauth2.TokenInfo, error) {
 	cli, err := m.GetClient(ctx, tgr.ClientID)

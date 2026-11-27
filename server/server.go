@@ -66,11 +66,36 @@ type Server struct {
 }
 
 func (s *Server) handleError(w http.ResponseWriter, req *AuthorizeRequest, err error) error {
+	ctx := context.Background()
+	if req != nil && req.Request != nil {
+		ctx = req.Request.Context()
+	}
+
 	if fn := s.PreRedirectErrorHandler; fn != nil {
-		return fn(req.Request.Context(), w, req, err)
+		return fn(ctx, w, req, err)
 	}
 
 	return s.redirectError(w, req, err)
+}
+
+func (s *Server) validateRedirectURI(ctx context.Context, req *AuthorizeRequest) error {
+	if req == nil || req.RedirectURI == "" {
+		return errors.ErrInvalidRedirectURI
+	}
+	if validator, ok := s.Manager.(RedirectURIValidator); ok {
+		return validator.ValidateRedirectURI(ctx, req.ClientID, req.RedirectURI)
+	}
+	return nil
+}
+
+func (s *Server) localError(w http.ResponseWriter, req *AuthorizeRequest, err error) error {
+	ctx := context.Background()
+	if req != nil && req.Request != nil {
+		ctx = req.Request.Context()
+	}
+
+	data, statusCode, header := s.GetErrorData(ctx, err)
+	return s.token(w, data, header, statusCode)
 }
 
 func (s *Server) redirectError(w http.ResponseWriter, req *AuthorizeRequest, err error) error {
@@ -78,7 +103,19 @@ func (s *Server) redirectError(w http.ResponseWriter, req *AuthorizeRequest, err
 		return err
 	}
 
-	data, _, _ := s.GetErrorData(req.Request.Context(), err)
+	ctx := context.Background()
+	if req.Request != nil {
+		ctx = req.Request.Context()
+	}
+
+	// Never redirect to a redirect URI that has not been validated. This also
+	// covers errors raised before the manager validates the authorization
+	// request, such as user denial or scope errors.
+	if err == errors.ErrInvalidRedirectURI || s.validateRedirectURI(ctx, req) != nil {
+		return s.localError(w, req, err)
+	}
+
+	data, _, _ := s.GetErrorData(ctx, err)
 	return s.redirect(w, req, data)
 }
 
@@ -275,6 +312,14 @@ func (s *Server) HandleAuthorizeRequest(w http.ResponseWriter, r *http.Request) 
 	req, err := s.ValidationAuthorizeRequest(r)
 	if err != nil {
 		return s.handleError(w, req, err)
+	}
+
+	// Validate the redirect target before handing control to the authorization
+	// handlers so later errors cannot be redirected to an unvalidated URI.
+	if req.RedirectURI != "" {
+		if err := s.validateRedirectURI(ctx, req); err != nil {
+			return s.handleError(w, req, err)
+		}
 	}
 
 	// user authorization
